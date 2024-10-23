@@ -1,7 +1,7 @@
 import json
 from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import urlopen
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from phi.tools import Toolkit
 
@@ -19,9 +19,11 @@ class YouTubeTools(Toolkit):
         get_video_captions: bool = True,
         get_video_data: bool = True,
         languages: Optional[List[str]] = None,
+        proxies: Optional[Dict[str, str]] = None,
+
     ):
         super().__init__(name="youtube_tools")
-
+        self.proxies = proxies
         self.languages: Optional[List[str]] = languages
         if get_video_captions:
             self.register(self.get_youtube_video_captions)
@@ -115,9 +117,9 @@ class YouTubeTools(Toolkit):
         try:
             captions = None
             if self.languages:
-                captions = YouTubeTranscriptApi.get_transcript(video_id, languages=self.languages)
+                captions = YouTubeTranscriptApi.get_transcript(video_id, languages=self.languages, proxies=self.proxies)
             else:
-                captions = YouTubeTranscriptApi.get_transcript(video_id)
+                captions = YouTubeTranscriptApi.get_transcript(video_id, proxies=self.proxies)
             # logger.debug(f"Captions for video {video_id}: {captions}")
             if captions:
                 return " ".join(line["text"] for line in captions)
