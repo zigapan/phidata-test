@@ -1,13 +1,14 @@
-from typing import Optional, List, Union, Dict, Any, cast
+from math import sqrt
 from hashlib import md5
+from typing import Optional, List, Union, Dict, Any, cast
 
 try:
     from sqlalchemy.dialects import postgresql
     from sqlalchemy.engine import create_engine, Engine
     from sqlalchemy.inspection import inspect
-    from sqlalchemy.orm import Session, sessionmaker
-    from sqlalchemy.schema import MetaData, Table, Column
-    from sqlalchemy.sql.expression import text, func, select
+    from sqlalchemy.orm import sessionmaker, scoped_session, Session
+    from sqlalchemy.schema import MetaData, Table, Column, Index
+    from sqlalchemy.sql.expression import text, func, select, desc, bindparam
     from sqlalchemy.types import DateTime, String
 except ImportError:
     raise ImportError("`sqlalchemy` not installed")
@@ -21,11 +22,19 @@ from phi.document import Document
 from phi.embedder import Embedder
 from phi.vectordb.base import VectorDb
 from phi.vectordb.distance import Distance
+from phi.vectordb.search import SearchType
 from phi.vectordb.pgvector.index import Ivfflat, HNSW
 from phi.utils.log import logger
-from phi.vectordb.search import SearchType
+
 
 class PgVector(VectorDb):
+    """
+    PgVector class for managing vector operations with PostgreSQL and pgvector.
+
+    This class provides methods for creating, inserting, searching, and managing
+    vector data in a PostgreSQL database using the pgvector extension.
+    """
+
     def __init__(
         self,
         table_name: str,
@@ -60,174 +69,333 @@ class PgVector(VectorDb):
             schema_version (int): Version of the database schema.
             auto_upgrade_schema (bool): Automatically upgrade schema if True.
         """
+        if not table_name:
+            raise ValueError("Table name must be provided.")
 
-        _engine: Optional[Engine] = db_engine
-        if _engine is None and db_url is not None:
-            _engine = create_engine(db_url)
+        if db_engine is None and db_url is None:
+            raise ValueError("Either 'db_url' or 'db_engine' must be provided.")
 
-        if _engine is None:
-            raise ValueError("Must provide either db_url or db_engine")
+        if db_engine is None:
+            if db_url is None:
+                raise ValueError("Must provide 'db_url' if 'db_engine' is None.")
+            try:
+                db_engine = create_engine(db_url)
+            except Exception as e:
+                logger.error(f"Failed to create engine from 'db_url': {e}")
+                raise
 
-        # Collection attributes
-        self.collection: str = collection
-        self.schema: Optional[str] = schema
-
-        # Database attributes
+        # Database settings
+        self.table_name: str = table_name
+        self.schema: str = schema
         self.db_url: Optional[str] = db_url
-        self.db_engine: Engine = _engine
+        self.db_engine: Engine = db_engine
         self.metadata: MetaData = MetaData(schema=self.schema)
 
         # Embedder for embedding the document contents
-        _embedder = embedder
-        if _embedder is None:
+        if embedder is None:
             from phi.embedder.openai import OpenAIEmbedder
 
-            _embedder = OpenAIEmbedder()
-        self.embedder: Embedder = _embedder
+            embedder = OpenAIEmbedder()
+        self.embedder: Embedder = embedder
         self.dimensions: Optional[int] = self.embedder.dimensions
 
+        if self.dimensions is None:
+            raise ValueError("Embedder.dimensions must be set.")
+
+        # Search type
+        self.search_type: SearchType = search_type
         # Distance metric
         self.distance: Distance = distance
-
         # Index for the table
         self.vector_index: Union[Ivfflat, HNSW] = vector_index
         # Enable prefix matching for full-text search
         self.prefix_match: bool = prefix_match
         # Weight for the vector similarity score in hybrid search
         self.vector_score_weight: float = vector_score_weight
+        # Content language for full-text search
+        self.content_language: str = content_language
 
-        # Index for the collection
-        self.index: Optional[Union[Ivfflat, HNSW]] = index
+        # Table schema version
+        self.schema_version: int = schema_version
+        # Automatically upgrade schema if True
+        self.auto_upgrade_schema: bool = auto_upgrade_schema
 
         # Database session
-        self.Session: sessionmaker[Session] = sessionmaker(bind=self.db_engine)
-
-        # Database table for the collection
+        self.Session: scoped_session = scoped_session(sessionmaker(bind=self.db_engine))
+        # Database table
         self.table: Table = self.get_table()
+        logger.debug(f"Initialized PgVector with table '{self.schema}.{self.table_name}'")
 
-    def get_table(self) -> Table:
-        return Table(
-            self.collection,
+    def get_table_v1(self) -> Table:
+        """
+        Get the SQLAlchemy Table object for schema version 1.
+
+        Returns:
+            Table: SQLAlchemy Table object representing the database table.
+        """
+        if self.dimensions is None:
+            raise ValueError("Embedder dimensions are not set.")
+        table = Table(
+            self.table_name,
             self.metadata,
+            Column("id", String, primary_key=True),
             Column("name", String),
             Column("meta_data", postgresql.JSONB, server_default=text("'{}'::jsonb")),
+            Column("filters", postgresql.JSONB, server_default=text("'{}'::jsonb"), nullable=True),
             Column("content", postgresql.TEXT),
             Column("embedding", Vector(self.dimensions)),
             Column("usage", postgresql.JSONB),
-            Column("created_at", DateTime(timezone=True), server_default=text("now()")),
-            Column("updated_at", DateTime(timezone=True), onupdate=text("now()")),
+            Column("created_at", DateTime(timezone=True), server_default=func.now()),
+            Column("updated_at", DateTime(timezone=True), onupdate=func.now()),
             Column("content_hash", String),
             extend_existing=True,
         )
 
+        # Add indexes
+        Index(f"idx_{self.table_name}_id", table.c.id)
+        Index(f"idx_{self.table_name}_name", table.c.name)
+        Index(f"idx_{self.table_name}_content_hash", table.c.content_hash)
+
+        return table
+
+    def get_table(self) -> Table:
+        """
+        Get the SQLAlchemy Table object based on the current schema version.
+
+        Returns:
+            Table: SQLAlchemy Table object representing the database table.
+        """
+        if self.schema_version == 1:
+            return self.get_table_v1()
+        else:
+            raise NotImplementedError(f"Unsupported schema version: {self.schema_version}")
+
     def table_exists(self) -> bool:
-        logger.debug(f"Checking if table exists: {self.table.name}")
+        """
+        Check if the table exists in the database.
+
+        Returns:
+            bool: True if the table exists, False otherwise.
+        """
+        logger.debug(f"Checking if table '{self.table.fullname}' exists.")
         try:
-            return inspect(self.db_engine).has_table(self.table.name, schema=self.schema)
+            return inspect(self.db_engine).has_table(self.table_name, schema=self.schema)
         except Exception as e:
-            logger.error(e)
+            logger.error(f"Error checking if table exists: {e}")
             return False
 
     def create(self) -> None:
+        """
+        Create the table if it does not exist.
+        """
         if not self.table_exists():
-            with self.Session() as sess:
-                with sess.begin():
-                    logger.debug("Creating extension: vector")
-                    sess.execute(text("create extension if not exists vector;"))
-                    if self.schema is not None:
-                        logger.debug(f"Creating schema: {self.schema}")
-                        sess.execute(text(f"create schema if not exists {self.schema};"))
-            logger.debug(f"Creating table: {self.collection}")
+            with self.Session() as sess, sess.begin():
+                logger.debug("Creating extension: vector")
+                sess.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                if self.schema is not None:
+                    logger.debug(f"Creating schema: {self.schema}")
+                    sess.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.schema};"))
+            logger.debug(f"Creating table: {self.table_name}")
             self.table.create(self.db_engine)
+
+    def _record_exists(self, column, value) -> bool:
+        """
+        Check if a record with the given column value exists in the table.
+
+        Args:
+            column: The column to check.
+            value: The value to search for.
+
+        Returns:
+            bool: True if the record exists, False otherwise.
+        """
+        try:
+            with self.Session() as sess, sess.begin():
+                stmt = select(1).where(column == value).limit(1)
+                result = sess.execute(stmt).first()
+                return result is not None
+        except Exception as e:
+            logger.error(f"Error checking if record exists: {e}")
+            return False
 
     def doc_exists(self, document: Document) -> bool:
         """
-        Validating if the document exists or not
+        Check if a document with the same content hash exists in the table.
 
         Args:
-            document (Document): Document to validate
+            document (Document): The document to check.
+
+        Returns:
+            bool: True if the document exists, False otherwise.
         """
-        columns = [self.table.c.name, self.table.c.content_hash]
-        with self.Session() as sess:
-            with sess.begin():
-                cleaned_content = document.content.replace("\x00", "\ufffd")
-                stmt = select(*columns).where(self.table.c.content_hash == md5(cleaned_content.encode()).hexdigest())
-                result = sess.execute(stmt).first()
-                return result is not None
+        cleaned_content = document.content.replace("\x00", "\ufffd")
+        content_hash = md5(cleaned_content.encode()).hexdigest()
+        return self._record_exists(self.table.c.content_hash, content_hash)
 
     def name_exists(self, name: str) -> bool:
         """
-        Validate if a row with this name exists or not
+        Check if a document with the given name exists in the table.
 
         Args:
-            name (str): Name to validate
+            name (str): The name to check.
+
+        Returns:
+            bool: True if a document with the name exists, False otherwise.
         """
-        with self.Session() as sess:
-            with sess.begin():
-                stmt = select(self.table.c.name).where(self.table.c.name == name)
-                result = sess.execute(stmt).first()
-                return result is not None
+        return self._record_exists(self.table.c.name, name)
 
-    def insert(self, documents: List[Document], batch_size: int = 10) -> None:
-        with self.Session() as sess:
-            counter = 0
-            for document in documents:
-                document.embed(embedder=self.embedder)
-                cleaned_content = document.content.replace("\x00", "\ufffd")
-                stmt = postgresql.insert(self.table).values(
-                    name=document.name,
-                    meta_data=document.meta_data,
-                    content=cleaned_content,
-                    embedding=document.embedding,
-                    usage=document.usage,
-                    content_hash=md5(cleaned_content.encode()).hexdigest(),
-                )
-                sess.execute(stmt)
-                counter += 1
-                logger.debug(f"Inserted document: {document.name} ({document.meta_data})")
-
-                # Commit every `batch_size` documents
-                if counter >= batch_size:
-                    sess.commit()
-                    logger.debug(f"Committed {counter} documents")
-                    counter = 0
-
-            # Commit any remaining documents
-            if counter > 0:
-                sess.commit()
-                logger.debug(f"Committed {counter} documents")
-
-    def upsert(self, documents: List[Document]) -> None:
+    def id_exists(self, id: str) -> bool:
         """
-        Upsert documents into the database.
+        Check if a document with the given ID exists in the table.
 
         Args:
-            documents (List[Document]): List of documents to upsert
+            id (str): The ID to check.
+
+        Returns:
+            bool: True if a document with the ID exists, False otherwise.
         """
-        with self.Session() as sess:
-            with sess.begin():
-                for document in documents:
-                    document.embed(embedder=self.embedder)
-                    cleaned_content = document.content.replace("\x00", "\ufffd")
-                    stmt = postgresql.insert(self.table).values(
-                        name=document.name,
-                        meta_data=document.meta_data,
-                        content=cleaned_content,
-                        embedding=document.embedding,
-                        usage=document.usage,
-                        content_hash=md5(cleaned_content.encode()).hexdigest(),
-                    )
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=["name", "content_hash"],
-                        set_=dict(
-                            meta_data=document.meta_data,
-                            content=stmt.excluded.content,
-                            embedding=stmt.excluded.embedding,
-                            usage=stmt.excluded.usage,
-                        ),
-                    )
-                    sess.execute(stmt)
-                    logger.debug(f"Upserted document: {document.name} ({document.meta_data})")
+        return self._record_exists(self.table.c.id, id)
+
+    def _clean_content(self, content: str) -> str:
+        """
+        Clean the content by replacing null characters.
+
+        Args:
+            content (str): The content to clean.
+
+        Returns:
+            str: The cleaned content.
+        """
+        return content.replace("\x00", "\ufffd")
+
+    def insert(
+        self,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+    ) -> None:
+        """
+        Insert documents into the database.
+
+        Args:
+            documents (List[Document]): List of documents to insert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+            batch_size (int): Number of documents to insert in each batch.
+        """
+        try:
+            with self.Session() as sess, sess.begin():
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i : i + batch_size]
+                    try:
+                        # Prepare documents for insertion
+                        batch_records = []
+                        for doc in batch_docs:
+                            try:
+                                doc.embed(embedder=self.embedder)
+                                cleaned_content = self._clean_content(doc.content)
+                                content_hash = md5(cleaned_content.encode()).hexdigest()
+                                _id = doc.id or content_hash
+                                record = {
+                                    "id": _id,
+                                    "name": doc.name,
+                                    "meta_data": doc.meta_data,
+                                    "filters": filters,
+                                    "content": cleaned_content,
+                                    "embedding": doc.embedding,
+                                    "usage": doc.usage,
+                                    "content_hash": content_hash,
+                                }
+                                batch_records.append(record)
+                            except Exception as e:
+                                logger.error(f"Error processing document '{doc.name}': {e}")
+
+                        # Insert the batch of records
+                        insert_stmt = postgresql.insert(self.table)
+                        sess.execute(insert_stmt, batch_records)
+                        sess.commit()
+                        logger.info(f"Inserted batch of {len(batch_records)} documents.")
+                    except Exception as e:
+                        logger.error(f"Error with batch {i}: {e}")
+                        sess.rollback()
+                        raise
+        except Exception as e:
+            logger.error(f"Error inserting documents: {e}")
+            raise
+
+    def upsert_available(self) -> bool:
+        """
+        Check if upsert operation is available.
+
+        Returns:
+            bool: Always returns True for PgVector.
+        """
+        return True
+
+    def upsert(
+        self,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+    ) -> None:
+        """
+        Upsert (insert or update) documents in the database.
+
+        Args:
+            documents (List[Document]): List of documents to upsert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+            batch_size (int): Number of documents to upsert in each batch.
+        """
+        try:
+            with self.Session() as sess, sess.begin():
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i : i + batch_size]
+                    try:
+                        # Prepare documents for upserting
+                        batch_records = []
+                        for doc in batch_docs:
+                            try:
+                                doc.embed(embedder=self.embedder)
+                                cleaned_content = self._clean_content(doc.content)
+                                content_hash = md5(cleaned_content.encode()).hexdigest()
+                                _id = doc.id or content_hash
+                                record = {
+                                    "id": _id,
+                                    "name": doc.name,
+                                    "meta_data": doc.meta_data,
+                                    "filters": filters,
+                                    "content": cleaned_content,
+                                    "embedding": doc.embedding,
+                                    "usage": doc.usage,
+                                    "content_hash": content_hash,
+                                }
+                                batch_records.append(record)
+                            except Exception as e:
+                                logger.error(f"Error processing document '{doc.name}': {e}")
+
+                        # Upsert the batch of records
+                        insert_stmt = postgresql.insert(self.table).values(batch_records)
+                        upsert_stmt = insert_stmt.on_conflict_do_update(
+                            index_elements=["id"],
+                            set_=dict(
+                                name=insert_stmt.excluded.name,
+                                meta_data=insert_stmt.excluded.meta_data,
+                                filters=insert_stmt.excluded.filters,
+                                content=insert_stmt.excluded.content,
+                                embedding=insert_stmt.excluded.embedding,
+                                usage=insert_stmt.excluded.usage,
+                                content_hash=insert_stmt.excluded.content_hash,
+                            ),
+                        )
+                        sess.execute(upsert_stmt)
+                        sess.commit()
+                        logger.info(f"Upserted batch of {len(batch_records)} documents.")
+                    except Exception as e:
+                        logger.error(f"Error with batch {i}: {e}")
+                        sess.rollback()
+                        raise
+        except Exception as e:
+            logger.error(f"Error upserting documents: {e}")
+            raise
 
     def search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
         """
@@ -433,10 +601,10 @@ class PgVector(VectorDb):
             return []
 
     def hybrid_search(
-            self,
-            query: str,
-            limit: int = 5,
-            filters: Optional[Dict[str, Any]] = None,
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> List[Document]:
         """
         Perform a hybrid search combining vector similarity and full-text search.
