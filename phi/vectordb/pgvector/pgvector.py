@@ -23,7 +23,7 @@ from phi.vectordb.base import VectorDb
 from phi.vectordb.distance import Distance
 from phi.vectordb.pgvector.index import Ivfflat, HNSW
 from phi.utils.log import logger
-
+from phi.vectordb.search import SearchType
 
 class PgVector(VectorDb):
     def __init__(
