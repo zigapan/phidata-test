@@ -28,14 +28,39 @@ from phi.utils.log import logger
 class PgVector(VectorDb):
     def __init__(
         self,
-        collection: str,
-        schema: Optional[str] = "ai",
+        table_name: str,
+        schema: str = "ai",
         db_url: Optional[str] = None,
         db_engine: Optional[Engine] = None,
         embedder: Optional[Embedder] = None,
+        search_type: SearchType = SearchType.vector,
+        vector_index: Union[Ivfflat, HNSW] = HNSW(),
         distance: Distance = Distance.cosine,
-        index: Optional[Union[Ivfflat, HNSW]] = HNSW(),
+        prefix_match: bool = False,
+        vector_score_weight: float = 0.5,
+        content_language: str = "english",
+        schema_version: int = 1,
+        auto_upgrade_schema: bool = False,
     ):
+        """
+        Initialize the PgVector instance.
+
+        Args:
+            table_name (str): Name of the table to store vector data.
+            schema (str): Database schema name.
+            db_url (Optional[str]): Database connection URL.
+            db_engine (Optional[Engine]): SQLAlchemy database engine.
+            embedder (Optional[Embedder]): Embedder instance for creating embeddings.
+            search_type (SearchType): Type of search to perform.
+            vector_index (Union[Ivfflat, HNSW]): Vector index configuration.
+            distance (Distance): Distance metric for vector comparisons.
+            prefix_match (bool): Enable prefix matching for full-text search.
+            vector_score_weight (float): Weight for vector similarity in hybrid search.
+            content_language (str): Language for full-text search.
+            schema_version (int): Version of the database schema.
+            auto_upgrade_schema (bool): Automatically upgrade schema if True.
+        """
+
         _engine: Optional[Engine] = db_engine
         if _engine is None and db_url is not None:
             _engine = create_engine(db_url)
@@ -59,10 +84,17 @@ class PgVector(VectorDb):
 
             _embedder = OpenAIEmbedder()
         self.embedder: Embedder = _embedder
-        self.dimensions: int = self.embedder.dimensions
+        self.dimensions: Optional[int] = self.embedder.dimensions
 
         # Distance metric
         self.distance: Distance = distance
+
+        # Index for the table
+        self.vector_index: Union[Ivfflat, HNSW] = vector_index
+        # Enable prefix matching for full-text search
+        self.prefix_match: bool = prefix_match
+        # Weight for the vector similarity score in hybrid search
+        self.vector_score_weight: float = vector_score_weight
 
         # Index for the collection
         self.index: Optional[Union[Ivfflat, HNSW]] = index
@@ -197,56 +229,331 @@ class PgVector(VectorDb):
                     sess.execute(stmt)
                     logger.debug(f"Upserted document: {document.name} ({document.meta_data})")
 
-    def search(self, query: str, limit: int = 5) -> List[Document]:
-        query_embedding = self.embedder.get_embedding(query)
-        if query_embedding is None:
-            logger.error(f"Error getting embedding for Query: {query}")
+    def search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """
+        Perform a search based on the configured search type.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        if self.search_type == SearchType.vector:
+            return self.vector_search(query=query, limit=limit, filters=filters)
+        elif self.search_type == SearchType.keyword:
+            return self.keyword_search(query=query, limit=limit, filters=filters)
+        elif self.search_type == SearchType.hybrid:
+            return self.hybrid_search(query=query, limit=limit, filters=filters)
+        else:
+            logger.error(f"Invalid search type '{self.search_type}'.")
             return []
 
-        columns = [
-            self.table.c.name,
-            self.table.c.meta_data,
-            self.table.c.content,
-            self.table.c.embedding,
-            self.table.c.usage,
-        ]
+    def vector_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """
+        Perform a vector similarity search.
 
-        stmt = select(*columns)
-        if self.distance == Distance.l2:
-            stmt = stmt.order_by(self.table.c.embedding.max_inner_product(query_embedding))
-        if self.distance == Distance.cosine:
-            stmt = stmt.order_by(self.table.c.embedding.cosine_distance(query_embedding))
-        if self.distance == Distance.max_inner_product:
-            stmt = stmt.order_by(self.table.c.embedding.max_inner_product(query_embedding))
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
 
-        stmt = stmt.limit(limit=limit)
-        logger.debug(f"Query: {stmt}")
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Get the embedding for the query string
+            query_embedding = self.embedder.get_embedding(query)
+            if query_embedding is None:
+                logger.error(f"Error getting embedding for Query: {query}")
+                return []
 
-        # Get neighbors
-        with self.Session() as sess:
-            with sess.begin():
-                if self.index is not None:
-                    if isinstance(self.index, Ivfflat):
-                        sess.execute(text(f"SET LOCAL ivfflat.probes = {self.index.probes}"))
-                    elif isinstance(self.index, HNSW):
-                        sess.execute(text(f"SET LOCAL hnsw.ef_search  = {self.index.ef_search}"))
-                neighbors = sess.execute(stmt).fetchall() or []
+            # Define the columns to select
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+            ]
 
-        # Build search results
-        search_results: List[Document] = []
-        for neighbor in neighbors:
-            search_results.append(
-                Document(
-                    name=neighbor.name,
-                    meta_data=neighbor.meta_data,
-                    content=neighbor.content,
-                    embedder=self.embedder,
-                    embedding=neighbor.embedding,
-                    usage=neighbor.usage,
+            # Build the base statement
+            stmt = select(*columns)
+
+            # Apply filters if provided
+            if filters is not None:
+                stmt = stmt.where(self.table.c.filters.contains(filters))
+
+            # Order the results based on the distance metric
+            if self.distance == Distance.l2:
+                stmt = stmt.order_by(self.table.c.embedding.l2_distance(query_embedding))
+            elif self.distance == Distance.cosine:
+                stmt = stmt.order_by(self.table.c.embedding.cosine_distance(query_embedding))
+            elif self.distance == Distance.max_inner_product:
+                stmt = stmt.order_by(self.table.c.embedding.max_inner_product(query_embedding))
+            else:
+                logger.error(f"Unknown distance metric: {self.distance}")
+                return []
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            logger.debug(f"Vector search query: {stmt}")
+
+            # Execute the query
+            try:
+                with self.Session() as sess, sess.begin():
+                    if self.vector_index is not None:
+                        if isinstance(self.vector_index, Ivfflat):
+                            sess.execute(text(f"SET LOCAL ivfflat.probes = {self.vector_index.probes}"))
+                        elif isinstance(self.vector_index, HNSW):
+                            sess.execute(text(f"SET LOCAL hnsw.ef_search = {self.vector_index.ef_search}"))
+                    results = sess.execute(stmt).fetchall()
+            except Exception as e:
+                logger.error(f"Error performing semantic search: {e}")
+                logger.error("Table might not exist, creating for future use")
+                self.create()
+                return []
+
+            # Process the results and convert to Document objects
+            search_results: List[Document] = []
+            for result in results:
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=result.meta_data,
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
                 )
-            )
 
-        return search_results
+            return search_results
+        except Exception as e:
+            logger.error(f"Error during vector search: {e}")
+            return []
+
+    def enable_prefix_matching(self, query: str) -> str:
+        """
+        Preprocess the query for prefix matching.
+
+        Args:
+            query (str): The original query.
+
+        Returns:
+            str: The processed query with prefix matching enabled.
+        """
+        # Append '*' to each word for prefix matching
+        words = query.strip().split()
+        processed_words = [word + "*" for word in words]
+        return " ".join(processed_words)
+
+    def keyword_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """
+        Perform a keyword search on the 'content' column.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Define the columns to select
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+            ]
+
+            # Build the base statement
+            stmt = select(*columns)
+
+            # Build the text search vector
+            ts_vector = func.to_tsvector(self.content_language, self.table.c.content)
+            # Create the ts_query using websearch_to_tsquery with parameter binding
+            processed_query = self.enable_prefix_matching(query) if self.prefix_match else query
+            ts_query = func.websearch_to_tsquery(self.content_language, bindparam("query", value=processed_query))
+            # Compute the text rank
+            text_rank = func.ts_rank_cd(ts_vector, ts_query)
+
+            # Apply filters if provided
+            if filters is not None:
+                # Use the contains() method for JSONB columns to check if the filters column contains the specified filters
+                stmt = stmt.where(self.table.c.filters.contains(filters))
+
+            # Order by the relevance rank
+            stmt = stmt.order_by(text_rank.desc())
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            logger.debug(f"Keyword search query: {stmt}")
+
+            # Execute the query
+            try:
+                with self.Session() as sess, sess.begin():
+                    results = sess.execute(stmt).fetchall()
+            except Exception as e:
+                logger.error(f"Error performing keyword search: {e}")
+                logger.error("Table might not exist, creating for future use")
+                self.create()
+                return []
+
+            # Process the results and convert to Document objects
+            search_results: List[Document] = []
+            for result in results:
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=result.meta_data,
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
+                )
+
+            return search_results
+        except Exception as e:
+            logger.error(f"Error during keyword search: {e}")
+            return []
+
+    def hybrid_search(
+            self,
+            query: str,
+            limit: int = 5,
+            filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
+        """
+        Perform a hybrid search combining vector similarity and full-text search.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Get the embedding for the query string
+            query_embedding = self.embedder.get_embedding(query)
+            if query_embedding is None:
+                logger.error(f"Error getting embedding for Query: {query}")
+                return []
+
+            # Define the columns to select
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+            ]
+
+            # Build the text search vector
+            ts_vector = func.to_tsvector(self.content_language, self.table.c.content)
+            # Create the ts_query using websearch_to_tsquery with parameter binding
+            processed_query = self.enable_prefix_matching(query) if self.prefix_match else query
+            ts_query = func.websearch_to_tsquery(self.content_language, bindparam("query", value=processed_query))
+            # Compute the text rank
+            text_rank = func.ts_rank_cd(ts_vector, ts_query)
+
+            # Compute the vector similarity score
+            if self.distance == Distance.l2:
+                # For L2 distance, smaller distances are better
+                vector_distance = self.table.c.embedding.l2_distance(query_embedding)
+                # Invert and normalize the distance to get a similarity score between 0 and 1
+                vector_score = 1 / (1 + vector_distance)
+            elif self.distance == Distance.cosine:
+                # For cosine distance, smaller distances are better
+                vector_distance = self.table.c.embedding.cosine_distance(query_embedding)
+                vector_score = 1 / (1 + vector_distance)
+            elif self.distance == Distance.max_inner_product:
+                # For inner product, higher values are better
+                # Assume embeddings are normalized, so inner product ranges from -1 to 1
+                raw_vector_score = self.table.c.embedding.max_inner_product(query_embedding)
+                # Normalize to range [0, 1]
+                vector_score = (raw_vector_score + 1) / 2
+            else:
+                logger.error(f"Unknown distance metric: {self.distance}")
+                return []
+
+            # Apply weights to control the influence of each score
+            # Validate the vector_weight parameter
+            if not 0 <= self.vector_score_weight <= 1:
+                raise ValueError("vector_score_weight must be between 0 and 1")
+            text_rank_weight = 1 - self.vector_score_weight  # weight for text rank
+
+            # Combine the scores into a hybrid score
+            hybrid_score = (self.vector_score_weight * vector_score) + (text_rank_weight * text_rank)
+
+            # Build the base statement, including the hybrid score
+            stmt = select(*columns, hybrid_score.label("hybrid_score"))
+
+            # Add the full-text search condition
+            # stmt = stmt.where(ts_vector.op("@@")(ts_query))
+
+            # Apply filters if provided
+            if filters is not None:
+                stmt = stmt.where(self.table.c.filters.contains(filters))
+
+            # Order the results by the hybrid score in descending order
+            stmt = stmt.order_by(desc("hybrid_score"))
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            logger.debug(f"Hybrid search query: {stmt}")
+
+            # Execute the query
+            try:
+                with self.Session() as sess, sess.begin():
+                    if self.vector_index is not None:
+                        if isinstance(self.vector_index, Ivfflat):
+                            sess.execute(text(f"SET LOCAL ivfflat.probes = {self.vector_index.probes}"))
+                        elif isinstance(self.vector_index, HNSW):
+                            sess.execute(text(f"SET LOCAL hnsw.ef_search = {self.vector_index.ef_search}"))
+                    results = sess.execute(stmt).fetchall()
+            except Exception as e:
+                logger.error(f"Error performing hybrid search: {e}")
+                return []
+
+            # Process the results and convert to Document objects
+            search_results: List[Document] = []
+            for result in results:
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=result.meta_data,
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
+                )
+
+            return search_results
+        except Exception as e:
+            logger.error(f"Error during hybrid search: {e}")
+            return []
 
     def delete(self) -> None:
         if self.table_exists():
