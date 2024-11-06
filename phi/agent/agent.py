@@ -439,7 +439,7 @@ class Agent(BaseModel):
     def update_model(self) -> None:
         if self.model is None:
             try:
-                from phi.model.openai import OpenAIChat
+                from phi.model.openai.chat import OpenAIChat
             except ModuleNotFoundError as e:
                 logger.exception(e)
                 logger.error(
